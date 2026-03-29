@@ -116,14 +116,15 @@ def get_form_action(html: str, base_url: str) -> str:
 
 def build_payload(fields: dict, name_field, phone_field, pin_field, adults_field, children_field, pin: int) -> dict:
     payload = fields.copy()
-    if name_field and settings.NAME:
-        payload[name_field] = settings.NAME
+    if name_field and settings.MY_NAME:
+        payload[name_field] = settings.MY_NAME
     payload[phone_field] = settings.PHONE
     payload[pin_field] = str(pin)
     if adults_field:
         payload[adults_field] = str(settings.ADULTS)
     if children_field:
-        payload[children_field] = str(settings.CHILDREN)
+        # DDLP2 values are offset: value="1" means 0 children, value="2" means 1 child, etc.
+        payload[children_field] = str(settings.CHILDREN + 1)
     return payload
 
 
@@ -168,7 +169,7 @@ def main():
         print("\n[!] PHONE is not set in .env")
         sys.exit(1)
 
-    print(f"\n[*] Name  : {settings.NAME or '(not set)'}")
+    print(f"\n[*] Name  : {settings.MY_NAME or '(not set)'}")
     print(f"[*] Phone : {settings.PHONE}")
     print(f"[*] Adults: {settings.ADULTS}  Children: {settings.CHILDREN}")
     print(f"[*] PIN range: {settings.PIN_START} – {settings.PIN_END}")

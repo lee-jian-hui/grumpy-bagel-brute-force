@@ -53,9 +53,9 @@ def fill_and_submit(driver: webdriver.Chrome, wait: WebDriverWait, pin: int):
 
     wait.until(EC.presence_of_element_located((By.NAME, "txtName")))
 
-    if settings.NAME:
+    if settings.MY_NAME:
         driver.find_element(By.NAME, "txtName").clear()
-        driver.find_element(By.NAME, "txtName").send_keys(settings.NAME)
+        driver.find_element(By.NAME, "txtName").send_keys(settings.MY_NAME)
 
     driver.find_element(By.NAME, "txtMobile").clear()
     driver.find_element(By.NAME, "txtMobile").send_keys(settings.PHONE)
@@ -69,13 +69,12 @@ def fill_and_submit(driver: webdriver.Chrome, wait: WebDriverWait, pin: int):
         pass
 
     try:
-        Select(driver.find_element(By.NAME, "DDLP2")).select_by_value(str(settings.CHILDREN))
+        # DDLP2 values are offset: value="1" means 0 children, value="2" means 1 child, etc.
+        Select(driver.find_element(By.NAME, "DDLP2")).select_by_value(str(settings.CHILDREN + 1))
     except NoSuchElementException:
         pass
 
-    # Click the submit button
-    submit = driver.find_element(By.CSS_SELECTOR, "input[type=submit], button[type=submit]")
-    submit.click()
+    driver.find_element(By.NAME, "btnLogin").click()
 
     # Wait for page to react
     time.sleep(1)
@@ -92,7 +91,7 @@ def main():
     pin_sequence = list(priority) + [p for p in full_range if p not in priority_set]
     total = len(pin_sequence)
 
-    print(f"[*] Name  : {settings.NAME or '(not set)'}")
+    print(f"[*] Name  : {settings.MY_NAME or '(not set)'}")
     print(f"[*] Phone : {settings.PHONE}")
     print(f"[*] Adults: {settings.ADULTS}  Children: {settings.CHILDREN}")
     print(f"[*] PIN range: {settings.PIN_START} – {settings.PIN_END}")

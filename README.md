@@ -43,7 +43,10 @@ The script will:
 | `CHILDREN` | Number of children | `0` |
 | `PIN_START` | First PIN to try | `1` |
 | `PIN_END` | Last PIN to try | `10000` |
+| `PIN_PRIORITY_START` | Start of range to try first (optional) | |
+| `PIN_PRIORITY_END` | End of range to try first (optional) | |
 | `DELAY` | Seconds between requests | `0.05` |
+| `PROXIES` | Comma-separated proxy URLs, rotated per attempt (optional) | |
 
 ## User Agent
 

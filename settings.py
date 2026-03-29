@@ -17,4 +17,5 @@ PRIORITY_RANGE = (
     if PIN_PRIORITY_START and PIN_PRIORITY_END else None
 )
 DELAY = float(os.getenv("DELAY", "0.05"))
+PINS_TO_AVOID = {int(p.strip()) for p in os.getenv("PINS_TO_AVOID", "").split(",") if p.strip()}
 PROXIES = [p.strip() for p in os.getenv("PROXIES", "").split(",") if p.strip()]

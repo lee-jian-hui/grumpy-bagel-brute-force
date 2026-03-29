@@ -206,7 +206,8 @@ def main():
     full_range = range(settings.PIN_START, settings.PIN_END + 1)
     priority = settings.PRIORITY_RANGE or range(0, 0)
     priority_set = set(priority)
-    pin_sequence = list(priority) + [p for p in full_range if p not in priority_set]
+    avoid = settings.PINS_TO_AVOID
+    pin_sequence = [p for p in priority if p not in avoid] + [p for p in full_range if p not in priority_set and p not in avoid]
     total = len(pin_sequence)
 
     # Split into chunks of CHUNK_SIZE
